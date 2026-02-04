@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"standup-report/internal/report"
@@ -58,6 +61,16 @@ type review struct {
 	HTMLURL string `json:"html_url"`
 }
 
+type prReviewCommentPayload struct {
+	Action      string        `json:"action"`
+	Comment     reviewComment `json:"comment"`
+	PullRequest pullRequest   `json:"pull_request"`
+}
+
+type reviewComment struct {
+	HTMLURL string `json:"html_url"`
+}
+
 type issuesPayload struct {
 	Action string `json:"action"`
 	Issue  issue  `json:"issue"`
@@ -79,13 +92,39 @@ type comment struct {
 	HTMLURL string `json:"html_url"`
 }
 
+type workflowRun struct {
+	Name       string    `json:"name"`
+	HeadBranch string    `json:"head_branch"`
+	HTMLURL    string    `json:"html_url"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+type workflowRunsResponse struct {
+	WorkflowRuns []workflowRun `json:"workflow_runs"`
+}
+
+type searchIssuesResponse struct {
+	Items []searchIssue `json:"items"`
+}
+
+type searchIssue struct {
+	Number        int    `json:"number"`
+	Title         string `json:"title"`
+	HTMLURL       string `json:"html_url"`
+	RepositoryURL string `json:"repository_url"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
 func FetchEvents(ctx context.Context, token string, since, until time.Time) ([]report.Event, error) {
 	username, err := getUser(ctx, token)
 	if err != nil {
 		return nil, fmt.Errorf("getting user: %w", err)
 	}
 
+	// Phase 1: Fetch user events and collect repo names.
 	var events []report.Event
+	repos := make(map[string]struct{})
+
 	for page := 1; page <= 10; page++ {
 		url := fmt.Sprintf("https://api.github.com/users/%s/events?per_page=100&page=%d", username, page)
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -117,15 +156,138 @@ func FetchEvents(ctx context.Context, token string, since, until time.Time) ([]r
 
 		for _, e := range ghEvents {
 			if e.CreatedAt.Before(since) {
-				return events, nil
+				goto phase2
 			}
 			if e.CreatedAt.After(until) {
 				continue
 			}
+			repos[e.Repo.Name] = struct{}{}
 			events = append(events, parseEvent(e)...)
 		}
 	}
 
+phase2:
+	// Phase 2: Fetch CI failures and pending reviews in parallel.
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		ciEvents, err := fetchCIFailures(ctx, token, username, repos, since, until)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: github CI failures: %v\n", err)
+			return
+		}
+		mu.Lock()
+		events = append(events, ciEvents...)
+		mu.Unlock()
+	}()
+
+	go func() {
+		defer wg.Done()
+		prEvents, err := fetchPendingReviews(ctx, token, username)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: github pending reviews: %v\n", err)
+			return
+		}
+		mu.Lock()
+		events = append(events, prEvents...)
+		mu.Unlock()
+	}()
+
+	wg.Wait()
+
+	return events, nil
+}
+
+func fetchCIFailures(ctx context.Context, token, username string, repos map[string]struct{}, since, until time.Time) ([]report.Event, error) {
+	var events []report.Event
+	for repoName := range repos {
+		url := fmt.Sprintf("https://api.github.com/repos/%s/actions/runs?actor=%s&status=failure&created=%%3E%s&per_page=100",
+			repoName, username, since.Format("2006-01-02"))
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Accept", "application/vnd.github+json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			continue
+		}
+
+		var result workflowRunsResponse
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			continue
+		}
+
+		for _, run := range result.WorkflowRuns {
+			if run.CreatedAt.After(until) {
+				continue
+			}
+			events = append(events, report.Event{
+				Category:  report.CategoryPipeline,
+				Action:    "failed",
+				Title:     fmt.Sprintf("%s on %s", run.Name, run.HeadBranch),
+				URL:       run.HTMLURL,
+				Repo:      repoName,
+				Source:    "github",
+				CreatedAt: run.CreatedAt,
+			})
+		}
+	}
+	return events, nil
+}
+
+func fetchPendingReviews(ctx context.Context, token, username string) ([]report.Event, error) {
+	url := fmt.Sprintf("https://api.github.com/search/issues?q=is:pr+is:open+review-requested:%s&per_page=100", username)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+
+	var result searchIssuesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	var events []report.Event
+	for _, item := range result.Items {
+		// Extract repo name from repository_url: "https://api.github.com/repos/owner/repo"
+		repoName := ""
+		if parts := strings.SplitN(item.RepositoryURL, "/repos/", 2); len(parts) == 2 {
+			repoName = parts[1]
+		}
+		events = append(events, report.Event{
+			Category:  report.CategoryPendingReview,
+			Action:    "awaiting your review",
+			Title:     fmt.Sprintf("#%d %s", item.Number, item.Title),
+			URL:       item.HTMLURL,
+			Repo:      repoName,
+			Source:    "github",
+			CreatedAt: item.CreatedAt,
+		})
+	}
 	return events, nil
 }
 
@@ -203,6 +365,21 @@ func parseEvent(e event) []report.Event {
 			Action:    p.Review.State,
 			Title:     fmt.Sprintf("#%d %s", p.PullRequest.Number, p.PullRequest.Title),
 			URL:       p.Review.HTMLURL,
+			Repo:      e.Repo.Name,
+			Source:    "github",
+			CreatedAt: e.CreatedAt,
+		}}
+
+	case "PullRequestReviewCommentEvent":
+		var p prReviewCommentPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		return []report.Event{{
+			Category:  report.CategoryReviewComment,
+			Action:    "commented",
+			Title:     fmt.Sprintf("#%d %s", p.PullRequest.Number, p.PullRequest.Title),
+			URL:       p.Comment.HTMLURL,
 			Repo:      e.Repo.Name,
 			Source:    "github",
 			CreatedAt: e.CreatedAt,

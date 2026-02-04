@@ -18,9 +18,12 @@ func Generate(events []Event, since, until time.Time) string {
 	categories := []EventCategory{
 		CategoryPR,
 		CategoryReview,
+		CategoryReviewComment,
 		CategoryIssue,
 		CategoryComment,
 		CategoryCommit,
+		CategoryPipeline,
+		CategoryPendingReview,
 	}
 
 	grouped := make(map[EventCategory][]Event)
@@ -38,7 +41,11 @@ func Generate(events []Event, since, until time.Time) string {
 			return catEvents[i].CreatedAt.After(catEvents[j].CreatedAt)
 		})
 
-		b.WriteString(fmt.Sprintf("%s:\n", cat))
+		header := string(cat)
+		if cat == CategoryPendingReview {
+			header += " (current)"
+		}
+		b.WriteString(fmt.Sprintf("%s:\n", header))
 		for _, e := range catEvents {
 			action := capitalize(e.Action)
 			b.WriteString(fmt.Sprintf("  - %s %s [%s] (%s)\n",

@@ -5,11 +5,14 @@ import "time"
 type EventCategory string
 
 const (
-	CategoryCommit  EventCategory = "Commits"
-	CategoryPR      EventCategory = "Pull Requests / Merge Requests"
-	CategoryReview  EventCategory = "Code Reviews"
-	CategoryIssue   EventCategory = "Issues"
-	CategoryComment EventCategory = "Comments"
+	CategoryCommit        EventCategory = "Commits"
+	CategoryPR            EventCategory = "Pull Requests / Merge Requests"
+	CategoryReview        EventCategory = "Code Reviews"
+	CategoryReviewComment EventCategory = "Review Comments"
+	CategoryIssue         EventCategory = "Issues"
+	CategoryComment       EventCategory = "Comments"
+	CategoryPipeline      EventCategory = "CI Pipeline Failures"
+	CategoryPendingReview EventCategory = "Pending Reviews"
 )
 
 type Event struct {
