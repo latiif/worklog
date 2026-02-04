@@ -1,4 +1,4 @@
-module standup-report
+module worklog
 
 go 1.25
 

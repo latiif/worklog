@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"standup-report/internal/github"
-	"standup-report/internal/gitlab"
-	"standup-report/internal/report"
+	"worklog/internal/github"
+	"worklog/internal/gitlab"
+	"worklog/internal/report"
 
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
@@ -17,12 +17,13 @@ import (
 )
 
 var (
-	sinceFlag string
-	untilFlag string
+	sinceFlag  string
+	untilFlag  string
+	outputFlag string
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "standup-report",
+	Use:   "worklog",
 	Short: "Generate a standup report from GitHub and GitLab activity",
 	RunE:  run,
 }
@@ -30,6 +31,7 @@ var rootCmd = &cobra.Command{
 func init() {
 	rootCmd.Flags().StringVar(&sinceFlag, "since", "", `start date inclusive, e.g. "2026-01-28", "yesterday", "2 weeks ago" (default: 7 days ago)`)
 	rootCmd.Flags().StringVar(&untilFlag, "until", "", `end date inclusive, e.g. "2026-02-04", "today", "last friday" (default: today)`)
+	rootCmd.Flags().StringVarP(&outputFlag, "output", "o", "text", `output format: "text", "table", or "json"`)
 }
 
 func Execute() error {
@@ -95,7 +97,13 @@ func run(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 	}
 
-	output := report.Generate(allEvents, since, until)
+	switch outputFlag {
+	case "text", "table", "json":
+	default:
+		return fmt.Errorf("invalid output format %q: must be one of \"text\", \"table\", \"json\"", outputFlag)
+	}
+
+	output := report.Generate(allEvents, since, until, outputFlag)
 	fmt.Print(output)
 	return nil
 }

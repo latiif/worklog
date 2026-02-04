@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"standup-report/internal/report"
+	"worklog/internal/report"
 )
 
 type user struct {

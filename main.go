@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"standup-report/cmd"
+	"worklog/cmd"
 )
 
 func main() {
