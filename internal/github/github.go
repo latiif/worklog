@@ -108,10 +108,10 @@ type searchIssuesResponse struct {
 }
 
 type searchIssue struct {
-	Number        int    `json:"number"`
-	Title         string `json:"title"`
-	HTMLURL       string `json:"html_url"`
-	RepositoryURL string `json:"repository_url"`
+	Number        int       `json:"number"`
+	Title         string    `json:"title"`
+	HTMLURL       string    `json:"html_url"`
+	RepositoryURL string    `json:"repository_url"`
 	CreatedAt     time.Time `json:"created_at"`
 }
 

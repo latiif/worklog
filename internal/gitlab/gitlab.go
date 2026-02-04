@@ -58,10 +58,10 @@ type pipeline struct {
 }
 
 type mergeRequest struct {
-	IID       int    `json:"iid"`
-	Title     string `json:"title"`
-	WebURL    string `json:"web_url"`
-	ProjectID int    `json:"project_id"`
+	IID       int       `json:"iid"`
+	Title     string    `json:"title"`
+	WebURL    string    `json:"web_url"`
+	ProjectID int       `json:"project_id"`
 	CreatedAt time.Time `json:"created_at"`
 }
 

@@ -1,4 +1,6 @@
 # worklog
+[![Go Report Card](https://goreportcard.com/badge/github.com/latiif/worklog)](https://goreportcard.com/report/github.com/latiif/worklog)
+![GitHub last commit](https://img.shields.io/github/last-commit/latiif/worklog)
 
 A single command that turns your GitHub and GitLab activity into a ready-to-post standup report. No more tab-switching or trying to remember what you did yesterday — `worklog` pulls your PRs, reviews, commits, issues, comments, CI failures, and pending review requests into one view.
 
