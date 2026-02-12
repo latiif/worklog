@@ -30,6 +30,7 @@ type user struct {
 
 type pushPayload struct {
 	Size    int      `json:"size"`
+	Ref     string   `json:"ref"`
 	Commits []commit `json:"commits"`
 }
 
@@ -321,6 +322,19 @@ func parseEvent(e event) []report.Event {
 		var p pushPayload
 		if err := json.Unmarshal(e.Payload, &p); err != nil {
 			return nil
+		}
+		if len(p.Commits) == 0 {
+			// Commits may be missing when the token lacks Contents read permission.
+			// Fall back to the ref name so the push still appears in the report.
+			branch := strings.TrimPrefix(p.Ref, "refs/heads/")
+			return []report.Event{{
+				Category:  report.CategoryCommit,
+				Action:    "pushed",
+				Title:     fmt.Sprintf("to %s", branch),
+				Repo:      e.Repo.Name,
+				Source:    "github",
+				CreatedAt: e.CreatedAt,
+			}}
 		}
 		var events []report.Event
 		for _, c := range p.Commits {

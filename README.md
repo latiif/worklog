@@ -63,6 +63,7 @@ Tokens can also be placed in a `.env` file in the working directory. Real enviro
 4. Under **Repository access**, select **All repositories** (or limit to specific repos you want tracked).
 5. Under **Permissions > Repository permissions**, grant:
    - **Actions** — Read-only (needed for CI failure reporting)
+   - **Contents** — Read-only (needed for commit details in push events)
    - **Issues** — Read-only
    - **Pull requests** — Read-only
    - **Metadata** — Read-only (automatically selected)
