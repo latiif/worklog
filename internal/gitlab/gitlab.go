@@ -330,6 +330,9 @@ func parseEvent(e event, proj *project) []report.Event {
 
 	switch {
 	case e.PushData != nil:
+		if e.PushData.CommitCount == 0 && e.PushData.CommitTitle == "" {
+			return nil
+		}
 		title := e.PushData.CommitTitle
 		if title == "" {
 			title = fmt.Sprintf("%d commit(s) to %s", e.PushData.CommitCount, e.PushData.Ref)
