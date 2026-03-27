@@ -2,131 +2,64 @@ package gitlab
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"maps"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	gl "gitlab.com/gitlab-org/api/client-go"
 	"worklog/internal/report"
 )
 
-type user struct {
-	ID       int    `json:"id"`
-	Username string `json:"username"`
-}
-
-type event struct {
-	ID          int       `json:"id"`
-	ActionName  string    `json:"action_name"`
-	TargetType  string    `json:"target_type"`
-	TargetTitle string    `json:"target_title"`
-	TargetIID   int       `json:"target_iid"`
-	CreatedAt   time.Time `json:"created_at"`
-	PushData    *pushData `json:"push_data"`
-	Note        *note     `json:"note"`
-	ProjectID   int       `json:"project_id"`
-}
-
-type pushData struct {
-	CommitCount int    `json:"commit_count"`
-	CommitTitle string `json:"commit_title"`
-	Ref         string `json:"ref"`
-}
-
-type note struct {
-	Body         string `json:"body"`
-	NoteableType string `json:"noteable_type"`
-}
-
-type project struct {
-	PathWithNamespace string `json:"path_with_namespace"`
-	WebURL            string `json:"web_url"`
-}
-
-type pipeline struct {
-	ID        int       `json:"id"`
-	Status    string    `json:"status"`
-	Ref       string    `json:"ref"`
-	WebURL    string    `json:"web_url"`
-	UpdatedAt time.Time `json:"updated_at"`
-	User      struct {
-		ID int `json:"id"`
-	} `json:"user"`
-}
-
-type mergeRequest struct {
-	IID       int       `json:"iid"`
-	Title     string    `json:"title"`
-	WebURL    string    `json:"web_url"`
-	ProjectID int       `json:"project_id"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
 func FetchEvents(ctx context.Context, token string, since, until time.Time) ([]report.Event, error) {
-	baseURL := baseURL()
+	client, err := newClient(token)
+	if err != nil {
+		return nil, err
+	}
 
-	u, err := getUser(ctx, baseURL, token)
+	u, _, err := client.Users.CurrentUser(gl.WithContext(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("getting user: %w", err)
 	}
 
-	// Phase 1: Fetch user events, build project cache, collect project IDs.
-	projectCache := make(map[int]*project)
-	projectIDs := make(map[int]struct{})
+	projectCache := make(map[int64]*gl.Project)
+	projectIDs := make(map[int64]struct{})
 	var events []report.Event
 
-	for page := 1; page <= 100; page++ {
-		endpoint := fmt.Sprintf("%s/api/v4/users/%d/events?per_page=100&page=%d&after=%s&before=%s",
-			baseURL, u.ID, page, since.Format("2006-01-02"), until.AddDate(0, 0, 1).Format("2006-01-02"))
+	afterTime := gl.ISOTime(since)
+	beforeTime := gl.ISOTime(until.AddDate(0, 0, 1))
 
-		req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	for page := int64(1); page <= 100; page++ {
+		opts := &gl.ListContributionEventsOptions{
+			After:       &afterTime,
+			Before:      &beforeTime,
+			ListOptions: gl.ListOptions{PerPage: 100, Page: page},
+		}
+		glEvents, resp, err := client.Events.ListCurrentUserContributionEvents(opts, gl.WithContext(ctx))
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("PRIVATE-TOKEN", token)
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-
-		var glEvents []event
-		if err := json.NewDecoder(resp.Body).Decode(&glEvents); err != nil {
-			resp.Body.Close()
-			return nil, err
-		}
-		resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
-		}
-
 		if len(glEvents) == 0 {
 			break
 		}
-
 		for _, e := range glEvents {
-			if e.CreatedAt.Before(since) {
-				continue
-			}
-
-			proj, err := resolveProject(ctx, baseURL, token, e.ProjectID, projectCache)
+			proj, err := resolveProject(ctx, client, e.ProjectID, projectCache)
 			if err != nil {
 				continue
 			}
-
 			projectIDs[e.ProjectID] = struct{}{}
 			events = append(events, parseEvent(e, proj)...)
+		}
+		if resp.NextPage == 0 {
+			break
 		}
 	}
 
 	// Phase 2: Fetch CI failures and pending reviews in parallel.
 	// Take a snapshot of the project cache for read-only use by goroutines.
-	cacheSnapshot := make(map[int]*project, len(projectCache))
+	cacheSnapshot := make(map[int64]*gl.Project, len(projectCache))
 	maps.Copy(cacheSnapshot, projectCache)
 
 	var mu sync.Mutex
@@ -135,7 +68,7 @@ func FetchEvents(ctx context.Context, token string, since, until time.Time) ([]r
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		ciEvents, err := fetchCIFailures(ctx, baseURL, token, u.ID, projectIDs, cacheSnapshot, since, until)
+		ciEvents, err := fetchCIFailures(ctx, client, u.Username, projectIDs, cacheSnapshot, since, until)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: gitlab CI failures: %v\n", err)
 			return
@@ -147,7 +80,7 @@ func FetchEvents(ctx context.Context, token string, since, until time.Time) ([]r
 
 	go func() {
 		defer wg.Done()
-		prEvents, err := fetchPendingReviews(ctx, baseURL, token, u.ID, cacheSnapshot)
+		prEvents, err := fetchPendingReviews(ctx, client, u.ID, cacheSnapshot)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: gitlab pending reviews: %v\n", err)
 			return
@@ -158,46 +91,32 @@ func FetchEvents(ctx context.Context, token string, since, until time.Time) ([]r
 	}()
 
 	wg.Wait()
-
 	return events, nil
 }
 
-func fetchCIFailures(ctx context.Context, baseURL, token string, userID int, projectIDs map[int]struct{}, cache map[int]*project, since, until time.Time) ([]report.Event, error) {
+func fetchCIFailures(ctx context.Context, client *gl.Client, username string, projectIDs map[int64]struct{}, cache map[int64]*gl.Project, since, until time.Time) ([]report.Event, error) {
 	var events []report.Event
+	status := gl.Failed
 	for pid := range projectIDs {
 		proj := cache[pid]
 		if proj == nil {
 			continue
 		}
-
-		endpoint := fmt.Sprintf("%s/api/v4/projects/%d/pipelines?status=failed&updated_after=%s&updated_before=%s&per_page=100",
-			baseURL, pid, since.Format("2006-01-02"), until.AddDate(0, 0, 1).Format("2006-01-02"))
-
-		req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+		opts := &gl.ListProjectPipelinesOptions{
+			Status:        &status,
+			Username:      new(username),
+			UpdatedAfter:  new(since),
+			UpdatedBefore: new(until.AddDate(0, 0, 1)),
+			ListOptions:   gl.ListOptions{PerPage: 100},
+		}
+		pipelines, _, err := client.Pipelines.ListProjectPipelines(pid, opts, gl.WithContext(ctx))
 		if err != nil {
 			continue
 		}
-		req.Header.Set("PRIVATE-TOKEN", token)
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			continue
-		}
-
-		var pipelines []pipeline
-		if err := json.NewDecoder(resp.Body).Decode(&pipelines); err != nil {
-			resp.Body.Close()
-			continue
-		}
-		resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			continue
-		}
-
 		for _, p := range pipelines {
-			if p.User.ID != userID {
-				continue
+			updatedAt := time.Time{}
+			if p.UpdatedAt != nil {
+				updatedAt = *p.UpdatedAt
 			}
 			events = append(events, report.Event{
 				Category:  report.CategoryPipeline,
@@ -206,47 +125,38 @@ func fetchCIFailures(ctx context.Context, baseURL, token string, userID int, pro
 				URL:       p.WebURL,
 				Repo:      proj.PathWithNamespace,
 				Source:    "gitlab",
-				CreatedAt: p.UpdatedAt,
+				CreatedAt: updatedAt,
 			})
 		}
 	}
 	return events, nil
 }
 
-func fetchPendingReviews(ctx context.Context, baseURL, token string, userID int, cacheSnapshot map[int]*project) ([]report.Event, error) {
-	endpoint := fmt.Sprintf("%s/api/v4/merge_requests?state=opened&reviewer_id=%d&scope=all&per_page=100",
-		baseURL, userID)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+func fetchPendingReviews(ctx context.Context, client *gl.Client, userID int64, cacheSnapshot map[int64]*gl.Project) ([]report.Event, error) {
+	opts := &gl.ListMergeRequestsOptions{
+		State:       new("opened"),
+		ReviewerID:  gl.ReviewerID(userID),
+		Scope:       new("all"),
+		ListOptions: gl.ListOptions{PerPage: 100},
+	}
+	mrs, _, err := client.MergeRequests.ListMergeRequests(opts, gl.WithContext(ctx))
 	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("PRIVATE-TOKEN", token)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
-	}
-
-	var mrs []mergeRequest
-	if err := json.NewDecoder(resp.Body).Decode(&mrs); err != nil {
 		return nil, err
 	}
 
 	// Local cache for project lookups (avoids races with the shared cache).
-	localCache := make(map[int]*project)
+	localCache := make(map[int64]*gl.Project)
 	maps.Copy(localCache, cacheSnapshot)
 
 	var events []report.Event
 	for _, mr := range mrs {
-		proj, err := resolveProject(ctx, baseURL, token, mr.ProjectID, localCache)
+		proj, err := resolveProject(ctx, client, mr.ProjectID, localCache)
 		if err != nil {
 			continue
+		}
+		createdAt := time.Time{}
+		if mr.CreatedAt != nil {
+			createdAt = *mr.CreatedAt
 		}
 		events = append(events, report.Event{
 			Category:  report.CategoryPendingReview,
@@ -255,78 +165,41 @@ func fetchPendingReviews(ctx context.Context, baseURL, token string, userID int,
 			URL:       mr.WebURL,
 			Repo:      proj.PathWithNamespace,
 			Source:    "gitlab",
-			CreatedAt: mr.CreatedAt,
+			CreatedAt: createdAt,
 		})
 	}
 	return events, nil
 }
 
-func baseURL() string {
+func newClient(token string) (*gl.Client, error) {
+	opts := []gl.ClientOptionFunc{}
 	if u := os.Getenv("GITLAB_URL"); u != "" {
-		return strings.TrimRight(u, "/")
+		opts = append(opts, gl.WithBaseURL(strings.TrimRight(u, "/")))
 	}
-	return "https://gitlab.com"
+	return gl.NewClient(token, opts...)
 }
 
-func getUser(ctx context.Context, baseURL, token string) (*user, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", baseURL+"/api/v4/user", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("PRIVATE-TOKEN", token)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
-	}
-
-	var u user
-	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
-		return nil, err
-	}
-	return &u, nil
-}
-
-func resolveProject(ctx context.Context, baseURL, token string, projectID int, cache map[int]*project) (*project, error) {
+func resolveProject(ctx context.Context, client *gl.Client, projectID int64, cache map[int64]*gl.Project) (*gl.Project, error) {
 	if p, ok := cache[projectID]; ok {
 		return p, nil
 	}
-
-	endpoint := fmt.Sprintf("%s/api/v4/projects/%d", baseURL, projectID)
-	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	proj, _, err := client.Projects.GetProject(projectID, &gl.GetProjectOptions{}, gl.WithContext(ctx))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("PRIVATE-TOKEN", token)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
-	}
-
-	var proj project
-	if err := json.NewDecoder(resp.Body).Decode(&proj); err != nil {
-		return nil, err
-	}
-	cache[projectID] = &proj
-	return &proj, nil
+	cache[projectID] = proj
+	return proj, nil
 }
 
-func parseEvent(e event, proj *project) []report.Event {
+func parseEvent(e *gl.ContributionEvent, proj *gl.Project) []report.Event {
 	repoName := proj.PathWithNamespace
+	createdAt := time.Time{}
+	if e.CreatedAt != nil {
+		createdAt = *e.CreatedAt
+	}
 
 	switch {
-	case e.PushData != nil:
+	case e.PushData.Ref != "":
 		if e.PushData.CommitCount == 0 && e.PushData.CommitTitle == "" {
 			return nil
 		}
@@ -340,7 +213,7 @@ func parseEvent(e event, proj *project) []report.Event {
 			Title:     title,
 			Repo:      repoName,
 			Source:    "gitlab",
-			CreatedAt: e.CreatedAt,
+			CreatedAt: createdAt,
 		}}
 
 	case e.TargetType == "MergeRequest":
@@ -355,7 +228,7 @@ func parseEvent(e event, proj *project) []report.Event {
 			URL:       fmt.Sprintf("%s/-/merge_requests/%d", proj.WebURL, e.TargetIID),
 			Repo:      repoName,
 			Source:    "gitlab",
-			CreatedAt: e.CreatedAt,
+			CreatedAt: createdAt,
 		}}
 
 	case e.TargetType == "Issue":
@@ -366,7 +239,7 @@ func parseEvent(e event, proj *project) []report.Event {
 			URL:       fmt.Sprintf("%s/-/issues/%d", proj.WebURL, e.TargetIID),
 			Repo:      repoName,
 			Source:    "gitlab",
-			CreatedAt: e.CreatedAt,
+			CreatedAt: createdAt,
 		}}
 
 	case e.Note != nil:
@@ -380,7 +253,7 @@ func parseEvent(e event, proj *project) []report.Event {
 			Title:     e.TargetTitle,
 			Repo:      repoName,
 			Source:    "gitlab",
-			CreatedAt: e.CreatedAt,
+			CreatedAt: createdAt,
 		}}
 	}
 

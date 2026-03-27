@@ -2,180 +2,76 @@ package github
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	gh "github.com/google/go-github/v69/github"
 	"worklog/internal/report"
 )
 
-type event struct {
-	Type      string          `json:"type"`
-	Repo      repo            `json:"repo"`
-	Payload   json.RawMessage `json:"payload"`
-	CreatedAt time.Time       `json:"created_at"`
-}
-
-type repo struct {
-	Name string `json:"name"`
-}
-
-type user struct {
-	Login string `json:"login"`
-}
-
-type pushPayload struct {
-	Size    int      `json:"size"`
-	Ref     string   `json:"ref"`
-	Commits []commit `json:"commits"`
-}
-
-type commit struct {
-	SHA     string `json:"sha"`
-	Message string `json:"message"`
-}
-
-type prPayload struct {
-	Action      string      `json:"action"`
-	PullRequest pullRequest `json:"pull_request"`
-}
-
-type pullRequest struct {
-	Number  int    `json:"number"`
-	Title   string `json:"title"`
-	HTMLURL string `json:"html_url"`
-	Merged  bool   `json:"merged"`
-}
-
-type prReviewPayload struct {
-	Action      string      `json:"action"`
-	Review      review      `json:"review"`
-	PullRequest pullRequest `json:"pull_request"`
-}
-
-type review struct {
-	State   string `json:"state"`
-	HTMLURL string `json:"html_url"`
-}
-
-type prReviewCommentPayload struct {
-	Action      string        `json:"action"`
-	Comment     reviewComment `json:"comment"`
-	PullRequest pullRequest   `json:"pull_request"`
-}
-
-type reviewComment struct {
-	HTMLURL string `json:"html_url"`
-}
-
-type issuesPayload struct {
-	Action string `json:"action"`
-	Issue  issue  `json:"issue"`
-}
-
-type issue struct {
-	Number  int    `json:"number"`
-	Title   string `json:"title"`
-	HTMLURL string `json:"html_url"`
-}
-
-type issueCommentPayload struct {
-	Action  string  `json:"action"`
-	Issue   issue   `json:"issue"`
-	Comment comment `json:"comment"`
-}
-
-type comment struct {
-	HTMLURL string `json:"html_url"`
-}
-
-type workflowRun struct {
-	Name       string    `json:"name"`
-	HeadBranch string    `json:"head_branch"`
-	HTMLURL    string    `json:"html_url"`
-	CreatedAt  time.Time `json:"created_at"`
-}
-
-type workflowRunsResponse struct {
-	WorkflowRuns []workflowRun `json:"workflow_runs"`
-}
-
-type searchIssuesResponse struct {
-	Items []searchIssue `json:"items"`
-}
-
-type searchIssue struct {
-	Number        int       `json:"number"`
-	Title         string    `json:"title"`
-	HTMLURL       string    `json:"html_url"`
-	RepositoryURL string    `json:"repository_url"`
-	CreatedAt     time.Time `json:"created_at"`
-}
-
 func FetchEvents(ctx context.Context, token string, since, until time.Time) ([]report.Event, error) {
-	username, err := getUser(ctx, token)
+	client := gh.NewClient(nil).WithAuthToken(token)
+
+	u, _, err := client.Users.Get(ctx, "")
 	if err != nil {
 		return nil, fmt.Errorf("getting user: %w", err)
 	}
+	username := u.GetLogin()
 
-	// Phase 1: Fetch user events and collect repo names.
 	var events []report.Event
 	repos := make(map[string]struct{})
+	// seenSHAs tracks commit SHAs from the event stream so that the commit
+	// search (phase 2) can skip duplicates.
+	seenSHAs := make(map[string]struct{})
 
+	opts := &gh.ListOptions{PerPage: 100}
 	for page := 1; page <= 10; page++ {
-		url := fmt.Sprintf("https://api.github.com/users/%s/events?per_page=100&page=%d", username, page)
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		opts.Page = page
+		ghEvents, _, err := client.Activity.ListEventsPerformedByUser(ctx, username, false, opts)
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Authorization", "Bearer "+token)
-		req.Header.Set("Accept", "application/vnd.github+json")
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-
-		var ghEvents []event
-		if err := json.NewDecoder(resp.Body).Decode(&ghEvents); err != nil {
-			resp.Body.Close()
-			return nil, err
-		}
-		resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
-		}
-
 		if len(ghEvents) == 0 {
 			break
 		}
-
+		done := false
 		for _, e := range ghEvents {
-			if e.CreatedAt.Before(since) {
-				goto phase2
+			createdAt := e.GetCreatedAt().Time
+			if createdAt.Before(since) {
+				done = true
+				break
 			}
-			if e.CreatedAt.After(until) {
+			if createdAt.After(until) {
 				continue
 			}
-			repos[e.Repo.Name] = struct{}{}
+			repoName := e.GetRepo().GetName()
+			repos[repoName] = struct{}{}
+			if e.GetType() == "PushEvent" {
+				if p, err := e.ParsePayload(); err == nil {
+					if push, ok := p.(*gh.PushEvent); ok {
+						for _, c := range push.Commits {
+							seenSHAs[c.GetSHA()] = struct{}{}
+						}
+					}
+				}
+			}
 			events = append(events, parseEvent(e)...)
+		}
+		if done {
+			break
 		}
 	}
 
-phase2:
-	// Phase 2: Fetch CI failures and pending reviews in parallel.
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
-		ciEvents, err := fetchCIFailures(ctx, token, username, repos, since, until)
+		ciEvents, err := fetchCIFailures(ctx, client, username, repos, since, until)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: github CI failures: %v\n", err)
 			return
@@ -187,7 +83,7 @@ phase2:
 
 	go func() {
 		defer wg.Done()
-		prEvents, err := fetchPendingReviews(ctx, token, username)
+		prEvents, err := fetchPendingReviews(ctx, client, username)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: github pending reviews: %v\n", err)
 			return
@@ -197,239 +93,216 @@ phase2:
 		mu.Unlock()
 	}()
 
-	wg.Wait()
+	go func() {
+		defer wg.Done()
+		commitEvents, err := fetchCommits(ctx, client, username, since, until, seenSHAs)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: github commit search: %v\n", err)
+			return
+		}
+		mu.Lock()
+		events = append(events, commitEvents...)
+		mu.Unlock()
+	}()
 
+	wg.Wait()
 	return events, nil
 }
 
-func fetchCIFailures(ctx context.Context, token, username string, repos map[string]struct{}, since, until time.Time) ([]report.Event, error) {
+func fetchCIFailures(ctx context.Context, client *gh.Client, username string, repos map[string]struct{}, since, until time.Time) ([]report.Event, error) {
 	var events []report.Event
 	for repoName := range repos {
-		url := fmt.Sprintf("https://api.github.com/repos/%s/actions/runs?actor=%s&status=failure&created=%%3E%s&per_page=100",
-			repoName, username, since.Format("2006-01-02"))
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		parts := strings.SplitN(repoName, "/", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		owner, repo := parts[0], parts[1]
+		opts := &gh.ListWorkflowRunsOptions{
+			Actor:       username,
+			Status:      "failure",
+			Created:     ">=" + since.Format("2006-01-02"),
+			ListOptions: gh.ListOptions{PerPage: 100},
+		}
+		result, _, err := client.Actions.ListRepositoryWorkflowRuns(ctx, owner, repo, opts)
 		if err != nil {
 			continue
 		}
-		req.Header.Set("Authorization", "Bearer "+token)
-		req.Header.Set("Accept", "application/vnd.github+json")
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			continue
-		}
-
-		var result workflowRunsResponse
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			resp.Body.Close()
-			continue
-		}
-		resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			continue
-		}
-
 		for _, run := range result.WorkflowRuns {
-			if run.CreatedAt.After(until) {
+			createdAt := run.GetCreatedAt().Time
+			if createdAt.After(until) {
 				continue
 			}
 			events = append(events, report.Event{
 				Category:  report.CategoryPipeline,
 				Action:    "failed",
-				Title:     fmt.Sprintf("%s on %s", run.Name, run.HeadBranch),
-				URL:       run.HTMLURL,
+				Title:     fmt.Sprintf("%s on %s", run.GetName(), run.GetHeadBranch()),
+				URL:       run.GetHTMLURL(),
 				Repo:      repoName,
 				Source:    "github",
-				CreatedAt: run.CreatedAt,
+				CreatedAt: createdAt,
 			})
 		}
 	}
 	return events, nil
 }
 
-func fetchPendingReviews(ctx context.Context, token, username string) ([]report.Event, error) {
-	url := fmt.Sprintf("https://api.github.com/search/issues?q=is:pr+is:open+review-requested:%s&per_page=100", username)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+func fetchPendingReviews(ctx context.Context, client *gh.Client, username string) ([]report.Event, error) {
+	query := fmt.Sprintf("is:pr is:open review-requested:%s", username)
+	opts := &gh.SearchOptions{ListOptions: gh.ListOptions{PerPage: 100}}
+	result, _, err := client.Search.Issues(ctx, query, opts)
 	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
-	}
-
-	var result searchIssuesResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
 
 	var events []report.Event
-	for _, item := range result.Items {
-		// Extract repo name from repository_url: "https://api.github.com/repos/owner/repo"
+	for _, item := range result.Issues {
 		repoName := ""
-		if parts := strings.SplitN(item.RepositoryURL, "/repos/", 2); len(parts) == 2 {
+		if parts := strings.SplitN(item.GetRepositoryURL(), "/repos/", 2); len(parts) == 2 {
 			repoName = parts[1]
 		}
 		events = append(events, report.Event{
 			Category:  report.CategoryPendingReview,
 			Action:    "awaiting your review",
-			Title:     fmt.Sprintf("#%d %s", item.Number, item.Title),
-			URL:       item.HTMLURL,
+			Title:     fmt.Sprintf("#%d %s", item.GetNumber(), item.GetTitle()),
+			URL:       item.GetHTMLURL(),
 			Repo:      repoName,
 			Source:    "github",
-			CreatedAt: item.CreatedAt,
+			CreatedAt: item.GetCreatedAt().Time,
 		})
 	}
 	return events, nil
 }
 
-func getUser(ctx context.Context, token string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/user", nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
+// fetchCommits uses the commit search API to find commits the user authored
+// in all accessible repos (including private ones). It skips SHAs already
+// seen in the event stream to avoid duplicates.
+func fetchCommits(ctx context.Context, client *gh.Client, username string, since, until time.Time, seenSHAs map[string]struct{}) ([]report.Event, error) {
+	query := fmt.Sprintf("author:%s author-date:%s..%s", username,
+		since.Format("2006-01-02"), until.Format("2006-01-02"))
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
+	var events []report.Event
+	opts := &gh.SearchOptions{ListOptions: gh.ListOptions{PerPage: 100}}
+	for {
+		results, resp, err := client.Search.Commits(ctx, query, opts)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range results.Commits {
+			if _, seen := seenSHAs[c.GetSHA()]; seen {
+				continue
+			}
+			authorDate := c.GetCommit().GetAuthor().GetDate().Time
+			events = append(events, report.Event{
+				Category:  report.CategoryCommit,
+				Action:    "pushed",
+				Title:     firstLine(c.GetCommit().GetMessage()),
+				URL:       c.GetHTMLURL(),
+				Repo:      c.GetRepository().GetFullName(),
+				Source:    "github",
+				CreatedAt: authorDate,
+			})
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unexpected status: %d", resp.StatusCode)
-	}
-
-	var u user
-	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
-		return "", err
-	}
-	return u.Login, nil
+	return events, nil
 }
 
-func parseEvent(e event) []report.Event {
-	switch e.Type {
-	case "PushEvent":
-		var p pushPayload
-		if err := json.Unmarshal(e.Payload, &p); err != nil {
-			return nil
-		}
+func parseEvent(e *gh.Event) []report.Event {
+	payload, err := e.ParsePayload()
+	if err != nil {
+		return nil
+	}
+	repoName := e.GetRepo().GetName()
+	createdAt := e.GetCreatedAt().Time
+
+	switch p := payload.(type) {
+	case *gh.PushEvent:
 		if len(p.Commits) == 0 {
-			// Commits may be missing when the token lacks Contents read permission.
-			// Fall back to the ref name so the push still appears in the report.
-			branch := strings.TrimPrefix(p.Ref, "refs/heads/")
+			branch := strings.TrimPrefix(p.GetRef(), "refs/heads/")
 			return []report.Event{{
 				Category:  report.CategoryCommit,
 				Action:    "pushed",
 				Title:     fmt.Sprintf("to %s", branch),
-				Repo:      e.Repo.Name,
+				Repo:      repoName,
 				Source:    "github",
-				CreatedAt: e.CreatedAt,
+				CreatedAt: createdAt,
 			}}
 		}
-		var events []report.Event
+		var evts []report.Event
 		for _, c := range p.Commits {
-			msg := firstLine(c.Message)
-			events = append(events, report.Event{
+			evts = append(evts, report.Event{
 				Category:  report.CategoryCommit,
 				Action:    "pushed",
-				Title:     msg,
-				Repo:      e.Repo.Name,
+				Title:     firstLine(c.GetMessage()),
+				Repo:      repoName,
 				Source:    "github",
-				CreatedAt: e.CreatedAt,
+				CreatedAt: createdAt,
 			})
 		}
-		return events
+		return evts
 
-	case "PullRequestEvent":
-		var p prPayload
-		if err := json.Unmarshal(e.Payload, &p); err != nil {
-			return nil
-		}
-		action := p.Action
-		if action == "closed" && p.PullRequest.Merged {
+	case *gh.PullRequestEvent:
+		action := p.GetAction()
+		if action == "closed" && p.GetPullRequest().GetMerged() {
 			action = "merged"
 		}
 		return []report.Event{{
 			Category:  report.CategoryPR,
 			Action:    action,
-			Title:     fmt.Sprintf("#%d %s", p.PullRequest.Number, p.PullRequest.Title),
-			URL:       p.PullRequest.HTMLURL,
-			Repo:      e.Repo.Name,
+			Title:     fmt.Sprintf("#%d %s", p.GetPullRequest().GetNumber(), p.GetPullRequest().GetTitle()),
+			URL:       p.GetPullRequest().GetHTMLURL(),
+			Repo:      repoName,
 			Source:    "github",
-			CreatedAt: e.CreatedAt,
+			CreatedAt: createdAt,
 		}}
 
-	case "PullRequestReviewEvent":
-		var p prReviewPayload
-		if err := json.Unmarshal(e.Payload, &p); err != nil {
-			return nil
-		}
+	case *gh.PullRequestReviewEvent:
 		return []report.Event{{
 			Category:  report.CategoryReview,
-			Action:    p.Review.State,
-			Title:     fmt.Sprintf("#%d %s", p.PullRequest.Number, p.PullRequest.Title),
-			URL:       p.Review.HTMLURL,
-			Repo:      e.Repo.Name,
+			Action:    p.GetReview().GetState(),
+			Title:     fmt.Sprintf("#%d %s", p.GetPullRequest().GetNumber(), p.GetPullRequest().GetTitle()),
+			URL:       p.GetReview().GetHTMLURL(),
+			Repo:      repoName,
 			Source:    "github",
-			CreatedAt: e.CreatedAt,
+			CreatedAt: createdAt,
 		}}
 
-	case "PullRequestReviewCommentEvent":
-		var p prReviewCommentPayload
-		if err := json.Unmarshal(e.Payload, &p); err != nil {
-			return nil
-		}
+	case *gh.PullRequestReviewCommentEvent:
 		return []report.Event{{
 			Category:  report.CategoryReviewComment,
 			Action:    "commented",
-			Title:     fmt.Sprintf("#%d %s", p.PullRequest.Number, p.PullRequest.Title),
-			URL:       p.Comment.HTMLURL,
-			Repo:      e.Repo.Name,
+			Title:     fmt.Sprintf("#%d %s", p.GetPullRequest().GetNumber(), p.GetPullRequest().GetTitle()),
+			URL:       p.GetComment().GetHTMLURL(),
+			Repo:      repoName,
 			Source:    "github",
-			CreatedAt: e.CreatedAt,
+			CreatedAt: createdAt,
 		}}
 
-	case "IssuesEvent":
-		var p issuesPayload
-		if err := json.Unmarshal(e.Payload, &p); err != nil {
-			return nil
-		}
+	case *gh.IssuesEvent:
 		return []report.Event{{
 			Category:  report.CategoryIssue,
-			Action:    p.Action,
-			Title:     fmt.Sprintf("#%d %s", p.Issue.Number, p.Issue.Title),
-			URL:       p.Issue.HTMLURL,
-			Repo:      e.Repo.Name,
+			Action:    p.GetAction(),
+			Title:     fmt.Sprintf("#%d %s", p.GetIssue().GetNumber(), p.GetIssue().GetTitle()),
+			URL:       p.GetIssue().GetHTMLURL(),
+			Repo:      repoName,
 			Source:    "github",
-			CreatedAt: e.CreatedAt,
+			CreatedAt: createdAt,
 		}}
 
-	case "IssueCommentEvent":
-		var p issueCommentPayload
-		if err := json.Unmarshal(e.Payload, &p); err != nil {
-			return nil
-		}
+	case *gh.IssueCommentEvent:
 		return []report.Event{{
 			Category:  report.CategoryComment,
 			Action:    "commented",
-			Title:     fmt.Sprintf("#%d %s", p.Issue.Number, p.Issue.Title),
-			URL:       p.Comment.HTMLURL,
-			Repo:      e.Repo.Name,
+			Title:     fmt.Sprintf("#%d %s", p.GetIssue().GetNumber(), p.GetIssue().GetTitle()),
+			URL:       p.GetComment().GetHTMLURL(),
+			Repo:      repoName,
 			Source:    "github",
-			CreatedAt: e.CreatedAt,
+			CreatedAt: createdAt,
 		}}
 	}
-
 	return nil
 }
 
