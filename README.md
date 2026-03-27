@@ -1,5 +1,9 @@
 # worklog
+[![Build](https://github.com/latiif/worklog/actions/workflows/go.yml/badge.svg)](https://github.com/latiif/worklog/actions/workflows/go.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/latiif/worklog)](https://goreportcard.com/report/github.com/latiif/worklog)
+[![Go version](https://img.shields.io/github/go-mod/go-version/latiif/worklog)](go.mod)
+[![GitHub release](https://img.shields.io/github/v/release/latiif/worklog)](https://github.com/latiif/worklog/releases)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 ![GitHub last commit](https://img.shields.io/github/last-commit/latiif/worklog)
 
 A single command that turns your GitHub and GitLab activity into a ready-to-post standup report.
