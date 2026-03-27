@@ -60,10 +60,10 @@ Tokens can also be placed in a `.env` file in the working directory. Real enviro
 1. Go to **Settings > Developer settings > Personal access tokens > Fine-grained tokens** ([direct link](https://github.com/settings/personal-access-tokens/new)).
 2. Give the token a descriptive name (e.g. `worklog`).
 3. Set an expiration.
-4. Under **Repository access**, select **All repositories** (or limit to specific repos you want tracked).
+4. Under **Repository access**, select **All repositories** to include private repos. Limiting to specific repos will hide commits and events from any repo not in the list.
 5. Under **Permissions > Repository permissions**, grant:
    - **Actions** — Read-only (needed for CI failure reporting)
-   - **Contents** — Read-only (needed for commit details in push events)
+   - **Contents** — Read-only (needed for commit details, including commits to private repos)
    - **Issues** — Read-only
    - **Pull requests** — Read-only
    - **Metadata** — Read-only (automatically selected)
