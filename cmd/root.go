@@ -62,9 +62,7 @@ func run(cmd *cobra.Command, args []string) error {
 	var errs []error
 
 	if githubToken != "" {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			events, err := github.FetchEvents(ctx, githubToken, since, until)
 			mu.Lock()
 			defer mu.Unlock()
@@ -73,13 +71,11 @@ func run(cmd *cobra.Command, args []string) error {
 				return
 			}
 			allEvents = append(allEvents, events...)
-		}()
+		})
 	}
 
 	if gitlabToken != "" {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			events, err := gitlab.FetchEvents(ctx, gitlabToken, since, until)
 			mu.Lock()
 			defer mu.Unlock()
@@ -88,7 +84,7 @@ func run(cmd *cobra.Command, args []string) error {
 				return
 			}
 			allEvents = append(allEvents, events...)
-		}()
+		})
 	}
 
 	wg.Wait()

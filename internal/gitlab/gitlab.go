@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"strings"
@@ -126,9 +127,7 @@ func FetchEvents(ctx context.Context, token string, since, until time.Time) ([]r
 	// Phase 2: Fetch CI failures and pending reviews in parallel.
 	// Take a snapshot of the project cache for read-only use by goroutines.
 	cacheSnapshot := make(map[int]*project, len(projectCache))
-	for k, v := range projectCache {
-		cacheSnapshot[k] = v
-	}
+	maps.Copy(cacheSnapshot, projectCache)
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -241,9 +240,7 @@ func fetchPendingReviews(ctx context.Context, baseURL, token string, userID int,
 
 	// Local cache for project lookups (avoids races with the shared cache).
 	localCache := make(map[int]*project)
-	for k, v := range cacheSnapshot {
-		localCache[k] = v
-	}
+	maps.Copy(localCache, cacheSnapshot)
 
 	var events []report.Event
 	for _, mr := range mrs {
